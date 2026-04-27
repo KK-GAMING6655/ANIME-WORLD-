@@ -1,10 +1,24 @@
 import discord
 import os
+import threading
+from flask import Flask
 from discord.ext import commands
 from discord import app_commands
 from datetime import datetime
 
-# --- Configuration via Environment Variables ---
+# --- 1. HEARTBEAT SERVER FOR RENDER ---
+# This satisfies Render's port requirement so the bot doesn't get shut down.
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is online!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# --- 2. BOT CONFIGURATION ---
 TOKEN = os.getenv('DISCORD_TOKEN')
 try:
     OWNER_ID = int(os.getenv('OWNER_ID'))
@@ -19,14 +33,17 @@ class MyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # This registers the slash commands
         await self.tree.sync()
         print(f"Logged in as {self.user} | Owner ID: {OWNER_ID}")
 
 bot = MyBot()
 
+# --- 3. UTILITY FUNCTIONS ---
 def parse_variables(content, interaction: discord.Interaction):
-    if not content: return content
+    """Replaces placeholders with real server data."""
+    if not content:
+        return content
+    
     variables = {
         "{guildname}": interaction.guild.name,
         "{membercount}": str(interaction.guild.member_count),
@@ -36,19 +53,26 @@ def parse_variables(content, interaction: discord.Interaction):
         "{owner}": interaction.guild.owner.display_name,
         "{user}": interaction.user.display_name
     }
+    
     for placeholder, value in variables.items():
         content = content.replace(placeholder, value)
     return content
 
 async def build_embed(interaction, heading, description, colour, image, thumbnail, author_name, footer):
+    """Helper to create the Discord Embed object."""
+    # Clean hex code input
     hex_str = colour.lstrip("#")
-    embed_color = int(hex_str, 16)
-    
+    try:
+        embed_color = int(hex_str, 16)
+    except ValueError:
+        embed_color = 0x3498db # Default Blue if color is invalid
+
     embed = discord.Embed(
         title=parse_variables(heading, interaction),
         description=parse_variables(description, interaction),
         color=embed_color
     )
+
     if image: embed.set_image(url=image)
     if thumbnail: embed.set_thumbnail(url=thumbnail)
     if footer: embed.set_footer(text=parse_variables(footer, interaction))
@@ -57,13 +81,14 @@ async def build_embed(interaction, heading, description, colour, image, thumbnai
         member = discord.utils.get(interaction.guild.members, name=author_name)
         icon_url = member.display_avatar.url if member else None
         embed.set_author(name=author_name, icon_url=icon_url)
+        
     return embed
 
-# --- This is the fix for the Group Error ---
+# --- 4. COMMAND GROUP ---
 class EmbedGroup(app_commands.Group, name="embed"):
-    """Group for embed commands"""
+    """All /embed commands reside here."""
 
-    @app_commands.command(name="create", description="Create and send an embed")
+    @app_commands.command(name="create", description="Create an owner-only embed")
     async def create(
         self,
         interaction: discord.Interaction, 
@@ -83,14 +108,18 @@ class EmbedGroup(app_commands.Group, name="embed"):
             main_embed = await build_embed(interaction, heading, description, colour, image, thumbnail, author, footer)
             plain_text = parse_variables(text, interaction) if text else None
             
-            success_embed = discord.Embed(description="✅ Your embed was successfully created!", color=discord.Color.green())
-            await interaction.response.send_message(embed=success_embed, ephemeral=True)
-            await interaction.channel.send(content=plain_text, embed=main_embed)
-        except Exception as e:
-            error_embed = discord.Embed(description=f"❌ Failed: {str(e)}", color=discord.Color.red())
-            await interaction.followup.send(embed=error_embed, ephemeral=True)
+            # Send Success Confirmation (Private)
+            success_msg = discord.Embed(description="✅ Your embed was successfully created!", color=discord.Color.green())
+            await interaction.response.send_message(embed=success_msg, ephemeral=True)
 
-    @app_commands.command(name="edit", description="Edit an existing embed")
+            # Send the actual Embed to the channel (Public)
+            await interaction.channel.send(content=plain_text, embed=main_embed)
+            
+        except Exception as e:
+            error_msg = discord.Embed(description=f"❌ Embed creation failed: {str(e)}", color=discord.Color.red())
+            await interaction.followup.send(embed=error_msg, ephemeral=True)
+
+    @app_commands.command(name="edit", description="Edit an existing embed via message URL")
     async def edit(
         self,
         interaction: discord.Interaction,
@@ -108,29 +137,37 @@ class EmbedGroup(app_commands.Group, name="embed"):
             return await interaction.response.send_message("❌ Access Denied: Owner Only.", ephemeral=True)
 
         try:
+            # Extract ID from URL (the last number in the link)
             msg_id = int(message_url.split('/')[-1])
             message = await interaction.channel.fetch_message(msg_id)
+            
             old_embed = message.embeds[0] if message.embeds else None
             
-            final_heading = heading or (old_embed.title if old_embed else "Title")
-            final_desc = description or (old_embed.description if old_embed else "Description")
-            final_colour = colour or (hex(old_embed.color.value).replace('0x', '') if old_embed else "FFFFFF")
+            # Fallback to old values if new ones aren't provided
+            f_heading = heading or (old_embed.title if old_embed else "Title")
+            f_desc = description or (old_embed.description if old_embed else "Description")
+            f_colour = colour or (hex(old_embed.color.value).replace('0x', '') if old_embed else "3498db")
             
-            updated_embed = await build_embed(interaction, final_heading, final_desc, final_colour, image, thumbnail, author, footer)
+            updated_embed = await build_embed(interaction, f_heading, f_desc, f_colour, image, thumbnail, author, footer)
             plain_text = parse_variables(text, interaction) if text else message.content
 
             await message.edit(content=plain_text, embed=updated_embed)
             
-            success_embed = discord.Embed(description="✅ Embed edited successfully!", color=discord.Color.green())
-            await interaction.response.send_message(embed=success_embed, ephemeral=True)
+            success_msg = discord.Embed(description="✅ Embed edited successfully!", color=discord.Color.green())
+            await interaction.response.send_message(embed=success_msg, ephemeral=True)
+            
         except Exception as e:
-            await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
+            await interaction.response.send_message(f"❌ Editing failed: {str(e)}", ephemeral=True)
 
-# Add the group to the bot tree
+# Register the group
 bot.tree.add_command(EmbedGroup())
 
+# --- 5. EXECUTION ---
 if TOKEN:
+    # Start Web Server in background thread
+    threading.Thread(target=run_web, daemon=True).start()
+    # Start Discord Bot
     bot.run(TOKEN)
 else:
-    print("No DISCORD_TOKEN found.")
+    print("FATAL ERROR: DISCORD_TOKEN environment variable not found.")
     
