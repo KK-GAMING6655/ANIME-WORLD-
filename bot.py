@@ -184,22 +184,37 @@ class Database:
                 created_at TEXT NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS log_sequence (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL
+            )
+            """,
             "CREATE INDEX IF NOT EXISTS idx_active_actions_resolved ON active_actions (resolved)",
             "CREATE INDEX IF NOT EXISTS idx_message_history_user ON message_history (user_id, created_at)",
         ]
         for stmt in statements:
             await self.client.execute(stmt)
+
+        # Migration: add channel_id if this DB was created before this column
+        # existed. Harmless no-op (caught) if it's already there.
+        try:
+            await self.client.execute("ALTER TABLE cases ADD COLUMN channel_id TEXT")
+        except Exception:
+            pass
+
         print("[database] Turso schema ready.")
 
     # ---- case CRUD ----
     async def create_case(self, case_type, guild_id, target_user_id, reason=None,
-                           proof_url=None, message_link=None, message_deleted=False, automod=False):
+                           proof_url=None, message_link=None, message_deleted=False, automod=False,
+                           channel_id=None):
         rs = await self.client.execute(
             """INSERT INTO cases (case_type, guild_id, target_user_id, reason, proof_url,
-               message_link, message_deleted, automod, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING case_id""",
+               message_link, message_deleted, automod, channel_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING case_id""",
             [case_type, str(guild_id), str(target_user_id), reason, proof_url,
-             message_link, int(message_deleted), int(automod), now_iso()],
+             message_link, int(message_deleted), int(automod), str(channel_id) if channel_id else None, now_iso()],
         )
         return rs.rows[0][0]
 
@@ -237,6 +252,27 @@ class Database:
             "UPDATE cases SET status='claimed', action_type=NULL, action_expires_at=NULL WHERE case_id=?",
             [case_id],
         )
+
+    async def mark_message_deleted(self, case_id, proof_text=None):
+        """Marks the case's message as deleted, blanks the message link, and
+        optionally stores proof text (e.g. the message's original content)."""
+        if proof_text is not None:
+            await self.client.execute(
+                "UPDATE cases SET message_deleted=1, message_link=NULL, proof_url=? WHERE case_id=?",
+                [proof_text, case_id],
+            )
+        else:
+            await self.client.execute(
+                "UPDATE cases SET message_deleted=1, message_link=NULL WHERE case_id=?",
+                [case_id],
+            )
+
+    # ---- log_sequence (independent numbering for mod-log embeds) ----
+    async def next_log_number(self):
+        rs = await self.client.execute(
+            "INSERT INTO log_sequence (created_at) VALUES (?) RETURNING log_id", [now_iso()]
+        )
+        return rs.rows[0][0]
 
     # ---- active_actions ----
     async def create_active_action(self, case_id, guild_id, user_id, action_type, expires_at_iso):
@@ -286,6 +322,12 @@ def parse_iso(s):
 
 def format_dt(dt: datetime) -> str:
     return dt.strftime("%d %B %Y, %H:%M UTC")
+
+
+def discord_ts(dt: datetime) -> str:
+    """Discord's native short date/time timestamp - renders localized and
+    live-updating on the user's client, e.g. <t:1735689600:f>."""
+    return f"<t:{int(dt.timestamp())}:f>"
 
 
 # =========================================================================
@@ -439,68 +481,78 @@ class EmbedGroup(app_commands.Group, name="embed"):
 bot.tree.add_command(EmbedGroup())
 
 
+
 # =========================================================================
 # SECTION E: CASE EMBED + MOD LOG EMBED BUILDERS
 # =========================================================================
 
-def build_case_embed(case: dict, guild: discord.Guild) -> discord.Embed:
-    case_id = case["case_id"]
+def build_case_description(case: dict) -> str:
     case_type = case["case_type"]
     target_user_id = case["target_user_id"]
     user_mention = f"<@{target_user_id}>"
-
-    channel_mention = ""
-    if case["message_link"]:
-        try:
-            channel_id = case["message_link"].split('/')[-2]
-            channel_mention = f"<#{channel_id}>"
-        except IndexError:
-            channel_mention = ""
+    channel_mention = f"<#{case['channel_id']}>" if case.get("channel_id") else ""
 
     template = CASE_DESCRIPTIONS.get(case_type, "{user} triggered a moderation case")
-    description = template.format(user=user_mention, channel=channel_mention)
+    return template.format(user=user_mention, channel=channel_mention)
+
+
+def build_case_embed(case: dict, guild: discord.Guild) -> discord.Embed:
+    case_id = case["case_id"]
+    reason_line = build_case_description(case)
 
     color = discord.Color.orange() if case["status"] == "open" else discord.Color.gold()
-    embed = discord.Embed(title=f"Case #{case_id}", description=description, color=color)
-
-    if case["proof_url"]:
-        embed.add_field(name="Proof", value=case["proof_url"], inline=False)
-
-    target_value = case["message_link"] if case["message_link"] else user_mention
-    embed.add_field(name="Message Link / User", value=target_value, inline=False)
 
     claimed_by = f"<@{case['claimed_by_id']}>" if case["claimed_by_id"] else "Unclaimed"
-    claimed_at = format_dt(parse_iso(case["claimed_at"])) if case["claimed_at"] else "-"
+    claimed_at = discord_ts(parse_iso(case["claimed_at"])) if case["claimed_at"] else "-"
     action = case["action_type"] or "Pending"
     if case["action_expires_at"]:
-        action += f" till {format_dt(parse_iso(case['action_expires_at']))}"
+        action += f" till {discord_ts(parse_iso(case['action_expires_at']))}"
     msg_deleted = "Yes" if case["message_deleted"] else "No"
+    message_link_value = case["message_link"] if case["message_link"] else "\u200b"
+    proof_value = case["proof_url"] if case["proof_url"] else "-"
 
-    embed.add_field(
-        name="Moderation Details",
-        value=(
-            f"**Claimed by:** {claimed_by}\n"
-            f"**Claimed at:** {claimed_at}\n"
-            f"**Action taken:** {action}\n"
-            f"**Message deleted:** {msg_deleted}"
-        ),
-        inline=False,
+    description = (
+        f"{reason_line}\n\n"
+        f"### Message Link\n"
+        f"{message_link_value}\n\n"
+        f"## Moderation Details\n\n"
+        f"### Claimed by:\n"
+        f"{claimed_by}\n\n"
+        f"### Claimed at:\n"
+        f"{claimed_at}\n\n"
+        f"### Action taken:\n"
+        f"{action}\n\n"
+        f"### Message deleted:\n"
+        f"{msg_deleted}\n\n"
+        f"### Proof:\n"
+        f"{proof_value}"
     )
+
+    embed = discord.Embed(title=f"Case #{case_id}", description=description, color=color)
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
 
 async def post_mod_log(guild: discord.Guild, case: dict, action_label: str, user: discord.abc.User,
-                        moderator_display: str, reason: str, expires_at: datetime | None, colour):
+                        moderator_display: str, reason: str, expires_at, colour):
     channel = guild.get_channel(MOD_LOG_CHANNEL_ID)
     if not channel:
         return
-    embed = discord.Embed(title=f"Case #{case['case_id']} | {action_label}", color=colour)
-    embed.add_field(name="User", value=f"{user} ({user.mention}) `{user.id}`", inline=False)
-    embed.add_field(name="Moderator", value=moderator_display, inline=False)
+    log_id = await db.next_log_number()
+
+    lines = [
+        f"### User\n{user} ({user.mention}) `{user.id}`",
+        f"### Moderator\n{moderator_display}",
+    ]
     if expires_at:
-        embed.add_field(name="Expires", value=format_dt(expires_at), inline=False)
-    embed.add_field(name="Reason", value=reason or "No reason provided", inline=False)
+        lines.append(f"### Expires\n{discord_ts(expires_at)}")
+    lines.append(f"### Reason\n{reason or 'No reason provided'}")
+
+    embed = discord.Embed(
+        title=f"Case #{log_id} | {action_label}",
+        description="\n\n".join(lines),
+        color=colour,
+    )
     embed.timestamp = datetime.now(timezone.utc)
     await channel.send(embed=embed)
 
@@ -515,10 +567,21 @@ async def post_expiry_log(guild: discord.Guild, case_id: int, action_label: str,
     except discord.NotFound:
         user_display = f"`{user_id}`"
 
-    embed = discord.Embed(title=f"Case #{case_id} | {action_label}", color=discord.Color.green())
-    embed.add_field(name="User", value=user_display, inline=False)
-    embed.add_field(name="Moderator", value="Automod (Anime World)", inline=False)
-    embed.add_field(name="Reason", value="Mute/timeout/ban duration expired", inline=False)
+    expired_label_map = {"Unban": "Ban", "Unmute": "Mute", "Untimeout": "Timeout"}
+    duration_kind = expired_label_map.get(action_label, action_label)
+
+    log_id = await db.next_log_number()
+    description = (
+        f"### User\n{user_display}\n\n"
+        f"### Moderator\nAutomod (Anime World)\n\n"
+        f"### Reason\n{duration_kind} duration expired"
+    )
+
+    embed = discord.Embed(
+        title=f"Case #{log_id} | {action_label}",
+        description=description,
+        color=discord.Color.green(),
+    )
     embed.timestamp = datetime.now(timezone.utc)
     await channel.send(embed=embed)
 
@@ -690,11 +753,29 @@ class PostActionView(discord.ui.View):
         await interaction.response.send_message(f"✅ Ticket opened: {thread.mention}", ephemeral=True)
 
 
-async def finalize_and_apply(interaction: discord.Interaction, case_id: int, action_type: str, delta: timedelta | None):
+async def delete_case_message(guild: discord.Guild, message_link: str):
+    """Attempts to delete the original offending message and returns its
+    text content (for use as Proof) if it could be fetched first."""
+    try:
+        parts = message_link.split('/')
+        channel_id = int(parts[-2])
+        msg_id = int(parts[-1])
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            return None
+        msg = await channel.fetch_message(msg_id)
+        content = msg.content or None
+        await msg.delete()
+        return content
+    except (discord.NotFound, discord.Forbidden, ValueError, IndexError):
+        return None
+
+
+async def finalize_and_apply(interaction: discord.Interaction, case_id: int, action_type: str, delta):
     case = await db.get_case(case_id)
     guild = interaction.guild
     member = guild.get_member(int(case["target_user_id"]))
-    reason = f"Case #{case_id}: {case['case_type']}"
+    reason = build_case_description(case)
     expires_at = (datetime.now(timezone.utc) + delta) if delta else None
     expires_at_iso = expires_at.isoformat() if expires_at else None
 
@@ -715,6 +796,13 @@ async def finalize_and_apply(interaction: discord.Interaction, case_id: int, act
         # "skip" -> no action taken
     except discord.Forbidden:
         pass
+
+    # If the message was still standing (not already removed by automod) and
+    # a real action was taken (anything but Skip), delete it now and capture
+    # its content as Proof, since the Message Link can no longer be shown.
+    if action_type != "skip" and not case["message_deleted"] and case["message_link"]:
+        content = await delete_case_message(guild, case["message_link"])
+        await db.mark_message_deleted(case_id, proof_text=content)
 
     await db.finalize_case(case_id, action_type, expires_at_iso)
     case = await db.get_case(case_id)
@@ -742,10 +830,12 @@ async def finalize_and_apply(interaction: discord.Interaction, case_id: int, act
 # =========================================================================
 
 async def create_case_and_post(guild: discord.Guild, case_type: str, target_user, reason=None,
-                                proof_url=None, message_link=None, message_deleted=False, automod=False):
+                                proof_url=None, message_link=None, message_deleted=False, automod=False,
+                                channel_id=None):
     case_id = await db.create_case(
         case_type, guild.id, target_user.id, reason=reason, proof_url=proof_url,
         message_link=message_link, message_deleted=message_deleted, automod=automod,
+        channel_id=channel_id,
     )
     case = await db.get_case(case_id)
     channel = guild.get_channel(MODERATION_CHANNEL_ID)
@@ -835,14 +925,15 @@ async def on_message(message: discord.Message):
         matches = await db.count_recent_matches(message.guild.id, message.author.id, content_hash, since)
         await db.log_message(message.guild.id, message.author.id, message.channel.id, content_hash)
         if matches + 1 >= SPAM_MESSAGE_THRESHOLD:
+            proof_text = content
             try:
                 await message.delete()
             except discord.NotFound:
                 pass
             case_id = await create_case_and_post(
                 message.guild, "spam", message.author,
-                reason="Repeated identical messages", message_link=message.jump_url,
-                message_deleted=True, automod=True,
+                reason="Repeated identical messages", proof_url=proof_text,
+                message_deleted=True, automod=True, channel_id=message.channel.id,
             )
             member = message.guild.get_member(message.author.id)
             if member:
@@ -854,8 +945,9 @@ async def on_message(message: discord.Message):
                     )
                     await db.finalize_case(case_id, "timeout",
                                             (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), True)
-                    await post_mod_log(message.guild, await db.get_case(case_id), "Timeout", message.author,
-                                        "Automod (Anime World)", "Spamming messages",
+                    case = await db.get_case(case_id)
+                    await post_mod_log(message.guild, case, "Timeout", message.author,
+                                        "Automod (Anime World)", build_case_description(case),
                                         datetime.now(timezone.utc) + timedelta(minutes=5), discord.Color.red())
                 except discord.Forbidden:
                     pass
@@ -864,14 +956,11 @@ async def on_message(message: discord.Message):
     # --- Server invite links ---
     if INVITE_REGEX.search(content) and message.channel.id not in ALLOWED_INVITE_CHANNELS \
             and message.author.id != OWNER_ID:
-        try:
-            await message.delete()
-        except discord.NotFound:
-            pass
         await create_case_and_post(
             message.guild, "invite_link", message.author,
             reason="Posted a server invite outside allowed channels",
-            message_link=message.jump_url, message_deleted=True, automod=False,
+            message_link=message.jump_url, message_deleted=False, automod=False,
+            channel_id=message.channel.id,
         )
         return
 
@@ -880,14 +969,15 @@ async def on_message(message: discord.Message):
     is_nsfw_link = any(k in lowered for k in NSFW_LINK_KEYWORDS)
     is_nsfw_telegram = "t.me/" in lowered and any(k in lowered for k in NSFW_TELEGRAM_KEYWORDS)
     if is_nsfw_link or is_nsfw_telegram:
+        proof_text = content
         try:
             await message.delete()
         except discord.NotFound:
             pass
         case_id = await create_case_and_post(
             message.guild, "nsfw_link", message.author,
-            reason="Posted an 18+ link", message_link=message.jump_url,
-            message_deleted=True, automod=True,
+            reason="Posted an 18+ link", proof_url=proof_text,
+            message_deleted=True, automod=True, channel_id=message.channel.id,
         )
         member = message.guild.get_member(message.author.id)
         if member:
@@ -896,8 +986,9 @@ async def on_message(message: discord.Message):
                 expires = datetime.now(timezone.utc) + timedelta(minutes=10)
                 await db.create_active_action(case_id, message.guild.id, member.id, "timeout", expires.isoformat())
                 await db.finalize_case(case_id, "timeout", expires.isoformat(), True)
-                await post_mod_log(message.guild, await db.get_case(case_id), "Timeout", message.author,
-                                    "Automod (Anime World)", "Posted an 18+ link", expires, discord.Color.red())
+                case = await db.get_case(case_id)
+                await post_mod_log(message.guild, case, "Timeout", message.author,
+                                    "Automod (Anime World)", build_case_description(case), expires, discord.Color.red())
             except discord.Forbidden:
                 pass
         return
@@ -909,17 +1000,19 @@ async def on_message(message: discord.Message):
         flagged, ai_categories = await ai_moderate_text(content)
 
     if flagged:
-        try:
-            await message.delete()
-        except discord.NotFound:
-            pass
         severe = bool(ai_categories & HF_SEVERE_LABELS)
-        case_id = await create_case_and_post(
-            message.guild, "bad_words", message.author,
-            reason="Used inappropriate language", message_link=message.jump_url,
-            message_deleted=True, automod=severe,
-        )
+
         if severe:
+            proof_text = content
+            try:
+                await message.delete()
+            except discord.NotFound:
+                pass
+            case_id = await create_case_and_post(
+                message.guild, "bad_words", message.author,
+                reason="Used inappropriate language", proof_url=proof_text,
+                message_deleted=True, automod=True, channel_id=message.channel.id,
+            )
             member = message.guild.get_member(message.author.id)
             if member:
                 try:
@@ -927,11 +1020,18 @@ async def on_message(message: discord.Message):
                     expires = datetime.now(timezone.utc) + timedelta(minutes=10)
                     await db.create_active_action(case_id, message.guild.id, member.id, "timeout", expires.isoformat())
                     await db.finalize_case(case_id, "timeout", expires.isoformat(), True)
-                    await post_mod_log(message.guild, await db.get_case(case_id), "Timeout", message.author,
-                                        "Automod (Anime World)", "Used inappropriate language", expires,
+                    case = await db.get_case(case_id)
+                    await post_mod_log(message.guild, case, "Timeout", message.author,
+                                        "Automod (Anime World)", build_case_description(case), expires,
                                         discord.Color.red())
                 except discord.Forbidden:
                     pass
+        else:
+            await create_case_and_post(
+                message.guild, "bad_words", message.author,
+                reason="Used inappropriate language", message_link=message.jump_url,
+                message_deleted=False, automod=False, channel_id=message.channel.id,
+            )
         return
 
 
@@ -950,7 +1050,7 @@ async def check_suspicious_profile(member: discord.Member):
             reason.append("flagged profile picture")
         await create_case_and_post(
             member.guild, "suspicious_profile", member,
-            reason=", ".join(reason), proof_url=member.display_avatar.url if member.display_avatar else None,
+            reason=", ".join(reason), proof_url=member.mention,
             automod=False,
         )
 
