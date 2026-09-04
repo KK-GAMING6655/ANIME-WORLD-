@@ -49,7 +49,9 @@ TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 HF_TOXICITY_MODEL = "unitary/toxic-bert"
 HF_INFERENCE_URL = f"https://api-inference.huggingface.co/models/{HF_TOXICITY_MODEL}"
-HF_THRESHOLD = 0.85  # 0-1 score; anything at/above this is flagged
+HF_THRESHOLD = 0.90  # 0-1 score; anything at/above this is flagged (specific categories only)
+HF_THREAT_THRESHOLD = 0.96  # stricter bar - "threat" easily misfires on hyperbolic jokes ("imma kill you")
+HF_SPECIFIC_LABELS = {"severe_toxic", "obscene", "insult", "identity_hate"}  # generic "toxic" is excluded - too noisy
 HF_SEVERE_LABELS = {"severe_toxic", "threat", "identity_hate"}
 
 # Free-tier avatar/image NSFW check - get keys at
@@ -96,28 +98,68 @@ CASE_DESCRIPTIONS = {
     "suspicious_profile": "{user} has a suspicious username/profile picture",
 }
 
-# Duration option sets for the dropdowns
-TIME_OPTIONS_LONG = {
+# --- Moderation-action / duration system (used by the modal + edit flows) ---
+ACTION_LABELS = {"kick": "Kick", "ban": "Ban", "mute": "Mute", "timeout": "Timeout", "skip": "Skip"}
+
+DURATION_KEYS_ORDER = [
+    "permanent", "1_minute", "5_minutes", "10_minutes", "1_hour", "12_hour",
+    "1_day", "3_days", "1_week", "2_weeks", "1_month", "2_months", "6_months", "1_year",
+]
+DURATION_LABELS = {
+    "permanent": "Permanent", "1_minute": "1 Minute", "5_minutes": "5 Minutes",
+    "10_minutes": "10 Minutes", "1_hour": "1 Hour", "12_hour": "12 Hour",
+    "1_day": "1 Day", "3_days": "3 Days", "1_week": "1 Week", "2_weeks": "2 Weeks",
+    "1_month": "1 Month", "2_months": "2 Months", "6_months": "6 Months", "1_year": "1 Year",
+}
+DURATION_DELTAS = {
     "permanent": None,
-    "1_hour": timedelta(hours=1),
-    "12_hour": timedelta(hours=12),
-    "1_day": timedelta(days=1),
-    "3_day": timedelta(days=3),
-    "1_week": timedelta(weeks=1),
-    "2_week": timedelta(weeks=2),
-    "1_month": timedelta(days=30),
-    "2_month": timedelta(days=60),
-    "6_month": timedelta(days=180),
+    "1_minute": timedelta(minutes=1), "5_minutes": timedelta(minutes=5), "10_minutes": timedelta(minutes=10),
+    "1_hour": timedelta(hours=1), "12_hour": timedelta(hours=12), "1_day": timedelta(days=1),
+    "3_days": timedelta(days=3), "1_week": timedelta(weeks=1), "2_weeks": timedelta(weeks=2),
+    "1_month": timedelta(days=30), "2_months": timedelta(days=60), "6_months": timedelta(days=180),
     "1_year": timedelta(days=365),
 }
-TIME_OPTIONS_TIMEOUT = {
-    "1_minute": timedelta(minutes=1),
-    "5_minutes": timedelta(minutes=5),
-    "10_minutes": timedelta(minutes=10),
-    "1_hour": timedelta(hours=1),
-    "1_day": timedelta(days=1),
-    "1_week": timedelta(weeks=1),
+VALID_DURATIONS_BY_ACTION = {
+    "ban": DURATION_KEYS_ORDER,
+    "mute": DURATION_KEYS_ORDER,
+    "timeout": ["1_minute", "5_minutes", "10_minutes", "1_hour", "1_day", "1_week"],
+    "kick": [],
+    "skip": [],
 }
+DEFAULT_DURATION_BY_ACTION = {"ban": "permanent", "mute": "permanent", "timeout": "1_week", "kick": None, "skip": None}
+
+
+def clamp_duration(action_type: str, duration_key):
+    """Kick/Skip never take a duration. Otherwise, if the chosen duration
+    isn't valid for this action, snap to the closest valid one by actual
+    time distance (e.g. Timeout + 12 Hour -> Timeout + 1 Hour, since that's
+    numerically closer than the next step up, 1 Day)."""
+    if action_type in ("kick", "skip"):
+        return None
+    allowed = VALID_DURATIONS_BY_ACTION.get(action_type, [])
+    if not allowed:
+        return None
+    if not duration_key or duration_key not in DURATION_DELTAS:
+        return DEFAULT_DURATION_BY_ACTION[action_type]
+    if duration_key in allowed:
+        return duration_key
+
+    target = DURATION_DELTAS[duration_key]
+    if target is None:
+        # "Permanent" requested but not valid for this action (e.g. Timeout) -
+        # substitute the longest duration this action actually allows.
+        return allowed[-1]
+
+    best_key, best_diff = None, None
+    for key in allowed:
+        delta = DURATION_DELTAS[key]
+        if delta is None:
+            continue
+        diff = abs((delta - target).total_seconds())
+        if best_diff is None or diff < best_diff:
+            best_key, best_diff = key, diff
+    return best_key or allowed[0]
+
 
 profanity.load_censor_words(whitelist_words=[])
 if EXTRA_BAD_WORDS:
@@ -202,6 +244,10 @@ class Database:
             await self.client.execute("ALTER TABLE cases ADD COLUMN channel_id TEXT")
         except Exception:
             pass
+        try:
+            await self.client.execute("ALTER TABLE cases ADD COLUMN reason_by_moderator TEXT")
+        except Exception:
+            pass
 
         print("[database] Turso schema ready.")
 
@@ -251,6 +297,32 @@ class Database:
         await self.client.execute(
             "UPDATE cases SET status='claimed', action_type=NULL, action_expires_at=NULL WHERE case_id=?",
             [case_id],
+        )
+
+    async def clear_action(self, case_id):
+        """Used by 'Remove Moderation Action' - clears the action but keeps
+        the case claimed (still resolved status stays as-is, it's just
+        showing no active action anymore)."""
+        await self.client.execute(
+            "UPDATE cases SET action_type=NULL, action_expires_at=NULL WHERE case_id=?", [case_id]
+        )
+
+    async def update_action_expiry(self, case_id, expires_at_iso):
+        await self.client.execute(
+            "UPDATE cases SET action_expires_at=? WHERE case_id=?", [expires_at_iso, case_id]
+        )
+        await self.client.execute(
+            "UPDATE active_actions SET expires_at=? WHERE case_id=? AND resolved=0", [expires_at_iso, case_id]
+        )
+
+    async def set_moderator_reason(self, case_id, reason_text):
+        await self.client.execute(
+            "UPDATE cases SET reason_by_moderator=? WHERE case_id=?", [reason_text, case_id]
+        )
+
+    async def resolve_active_actions_for_case(self, case_id):
+        await self.client.execute(
+            "UPDATE active_actions SET resolved=1 WHERE case_id=? AND resolved=0", [case_id]
         )
 
     async def mark_message_deleted(self, case_id, proof_text=None):
@@ -362,9 +434,9 @@ class MyBot(commands.Bot):
         # message/DB at click-time rather than from anything stored on
         # the view instance itself, which is what makes this safe.
         self.add_view(ClaimView())
-        self.add_view(ModerationActionView())
-        self.add_view(LongDurationView())
-        self.add_view(TimeoutDurationView())
+        self.add_view(ActionButtonView())
+        self.add_view(EditChoiceView())
+        self.add_view(ChangeDurationView())
         self.add_view(PostActionView())
 
         await self.tree.sync()
@@ -479,7 +551,6 @@ class EmbedGroup(app_commands.Group, name="embed"):
             await interaction.response.send_message(f"❌ Editing failed: {str(e)}", ephemeral=True)
 
 bot.tree.add_command(EmbedGroup())
-
 
 
 # =========================================================================
@@ -619,57 +690,228 @@ class ClaimView(discord.ui.View):
         await db.claim_case(case_id, interaction.user.id)
         case = await db.get_case(case_id)
         embed = build_case_embed(case, interaction.guild)
-        await interaction.response.edit_message(embed=embed, view=ModerationActionView())
+        await interaction.response.edit_message(embed=embed, view=ActionButtonView())
 
 
-class ModerationActionSelect(discord.ui.Select):
+class ActionButtonView(discord.ui.View):
     def __init__(self):
-        options = [
-            discord.SelectOption(label="Kick", value="kick"),
-            discord.SelectOption(label="Ban", value="ban"),
-            discord.SelectOption(label="Mute", value="mute"),
-            discord.SelectOption(label="Timeout", value="timeout"),
-            discord.SelectOption(label="Skip", value="skip"),
-        ]
-        super().__init__(placeholder="Moderation actions", options=options,
-                          custom_id="modsys:action_select", min_values=1, max_values=1)
+        super().__init__(timeout=None)
 
-    async def callback(self, interaction: discord.Interaction):
+    @discord.ui.button(label="Action", style=discord.ButtonStyle.primary, custom_id="modsys:action_button")
+    async def action(self, interaction: discord.Interaction, button: discord.ui.Button):
         case_id = await get_case_id_from_message(interaction.message)
         case = await db.get_case(case_id)
-        if not case:
-            return await interaction.response.send_message("❌ Case not found.", ephemeral=True)
-        if not case["claimed_by_id"] or int(case["claimed_by_id"]) != interaction.user.id:
+        if not case or not case["claimed_by_id"] or int(case["claimed_by_id"]) != interaction.user.id:
             return await interaction.response.send_message(
                 "❌ Only the moderator who claimed this case can act on it.", ephemeral=True
             )
+        await interaction.response.send_modal(ModerationActionModal(case_id=case_id))
+
+
+class ModerationActionModal(discord.ui.Modal):
+    """One modal used both for the first action on a case and for
+    'Change Moderation Action' during editing. Select menus inside modals
+    are a very recent Discord platform feature (added within the last few
+    weeks); each select must be wrapped in a discord.ui.Label."""
+
+    def __init__(self, case_id: int, prefill_reason: str = None):
+        super().__init__(title="Moderation Action", custom_id="modsys:modal", timeout=None)
+        self.case_id = case_id
+
+        self.action_select = discord.ui.Select(
+            custom_id="modsys:modal_action", min_values=1, max_values=1, required=True,
+            options=[discord.SelectOption(label=v) for v in ACTION_LABELS.values()],
+        )
+        self.duration_select = discord.ui.Select(
+            custom_id="modsys:modal_duration", min_values=0, max_values=1, required=False,
+            options=[discord.SelectOption(label=DURATION_LABELS[k], value=k) for k in DURATION_KEYS_ORDER],
+        )
+        self.reason_input = discord.ui.TextInput(
+            label="Reason", custom_id="modsys:modal_reason", style=discord.TextStyle.paragraph,
+            required=False, max_length=1000, default=prefill_reason,
+        )
+
+        self.add_item(discord.ui.Label(text="Moderation Actions", component=self.action_select))
+        self.add_item(discord.ui.Label(text="Duration", component=self.duration_select))
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        action_type = self.action_select.values[0].lower()
+        duration_raw = self.duration_select.values[0] if self.duration_select.values else None
+        duration_key = clamp_duration(action_type, duration_raw)
+        reason_text = self.reason_input.value.strip() if self.reason_input.value else None
+
+        case = await db.get_case(self.case_id)
+        is_edit = bool(case and case["action_type"])
+        await apply_moderation_action(interaction, self.case_id, action_type, duration_key,
+                                       reason_text, is_edit_change_action=is_edit)
+
+
+async def revert_current_action(case: dict, guild: discord.Guild):
+    """Undoes whatever punishment is currently live for this case (used
+    before applying a replacement action, and for 'Remove Moderation
+    Action')."""
+    action_type = case["action_type"]
+    if not action_type or action_type in ("skip", "kick"):
+        pass
+    else:
+        user_id = int(case["target_user_id"])
+        try:
+            if action_type == "ban":
+                await guild.unban(discord.Object(id=user_id), reason="Moderation action changed/removed")
+            elif action_type == "mute":
+                member = guild.get_member(user_id)
+                role = get_muted_role(guild)
+                if member and role:
+                    await member.remove_roles(role, reason="Moderation action changed/removed")
+            elif action_type == "timeout":
+                member = guild.get_member(user_id)
+                if member:
+                    await member.timeout(None, reason="Moderation action changed/removed")
+        except (discord.NotFound, discord.Forbidden):
+            pass
+    await db.resolve_active_actions_for_case(case["case_id"])
+
+
+async def delete_case_message(guild: discord.Guild, message_link: str):
+    """Attempts to delete the original offending message and returns its
+    text content (for use as Proof) if it could be fetched first."""
+    try:
+        parts = message_link.split('/')
+        channel_id = int(parts[-2])
+        msg_id = int(parts[-1])
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            return None
+        msg = await channel.fetch_message(msg_id)
+        content = msg.content or None
+        await msg.delete()
+        return content
+    except (discord.NotFound, discord.Forbidden, ValueError, IndexError):
+        return None
+
+
+async def apply_moderation_action(interaction: discord.Interaction, case_id: int, action_type: str,
+                                   duration_key, reason_text, is_edit_change_action: bool = False):
+    case = await db.get_case(case_id)
+    guild = interaction.guild
+    member = guild.get_member(int(case["target_user_id"]))
+    case_reason = build_case_description(case)
+
+    if is_edit_change_action:
+        await revert_current_action(case, guild)
+
+    delta = DURATION_DELTAS.get(duration_key) if duration_key else None
+    expires_at = (datetime.now(timezone.utc) + delta) if delta else None
+    expires_at_iso = expires_at.isoformat() if expires_at else None
+
+    try:
+        if action_type == "kick" and member:
+            await member.kick(reason=case_reason)
+        elif action_type == "ban":
+            await guild.ban(member or discord.Object(id=int(case["target_user_id"])), reason=case_reason)
+            await db.create_active_action(case_id, guild.id, case["target_user_id"], "ban", expires_at_iso)
+        elif action_type == "mute" and member:
+            role = get_muted_role(guild)
+            if role:
+                await member.add_roles(role, reason=case_reason)
+            await db.create_active_action(case_id, guild.id, case["target_user_id"], "mute", expires_at_iso)
+        elif action_type == "timeout" and member:
+            await member.timeout(delta, reason=case_reason)
+            await db.create_active_action(case_id, guild.id, case["target_user_id"], "timeout", expires_at_iso)
+        # "skip" -> no action taken
+    except discord.Forbidden:
+        pass
+
+    if action_type != "skip" and not case["message_deleted"] and case["message_link"]:
+        content = await delete_case_message(guild, case["message_link"])
+        await db.mark_message_deleted(case_id, proof_text=content)
+
+    await db.finalize_case(case_id, action_type, expires_at_iso)
+    if reason_text:
+        await db.set_moderator_reason(case_id, reason_text)
+    case = await db.get_case(case_id)
+
+    if action_type != "skip":
+        try:
+            user = member or await bot.fetch_user(int(case["target_user_id"]))
+            moderator_display = f"<@{case['claimed_by_id']}>" if not case["automod"] else "Automod (Anime World)"
+            log_reason = "Changed Moderation Action" if is_edit_change_action else case_reason
+            await post_mod_log(guild, case, ACTION_LABELS[action_type], user, moderator_display,
+                                log_reason, expires_at, discord.Color.red())
+        except discord.NotFound:
+            pass
+
+    embed = build_case_embed(case, guild)
+    view = discord.ui.View() if action_type == "skip" else PostActionView()
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+class EditChoiceSelect(discord.ui.Select):
+    def __init__(self, duration_capable: bool = True):
+        if duration_capable:
+            options = [
+                discord.SelectOption(label="Remove Moderation Action", value="remove"),
+                discord.SelectOption(label="Change Duration", value="change_duration"),
+                discord.SelectOption(label="Change Moderation Action", value="change_action"),
+                discord.SelectOption(label="Cancel", value="cancel"),
+            ]
+        else:
+            options = [
+                discord.SelectOption(label="Change Moderation Action", value="change_action"),
+                discord.SelectOption(label="Cancel", value="cancel"),
+            ]
+        super().__init__(placeholder="Edit", options=options, custom_id="modsys:edit_choice",
+                          min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        case_id = await get_case_id_from_message(interaction.message)
+        case = await db.get_case(case_id)
+        if not case or not case["claimed_by_id"] or int(case["claimed_by_id"]) != interaction.user.id:
+            return await interaction.response.send_message("❌ Not your case to act on.", ephemeral=True)
 
         choice = self.values[0]
-        await db.set_case_action_type(case_id, choice)
+        guild = interaction.guild
 
-        if choice in ("kick", "skip"):
-            await finalize_and_apply(interaction, case_id, choice, None)
+        if choice == "cancel":
+            embed = build_case_embed(case, guild)
+            await interaction.response.edit_message(embed=embed, view=PostActionView())
             return
 
-        view = LongDurationView() if choice in ("ban", "mute") else TimeoutDurationView()
-        case = await db.get_case(case_id)
-        embed = build_case_embed(case, interaction.guild)
-        await interaction.response.edit_message(embed=embed, view=view)
+        if choice == "remove":
+            await revert_current_action(case, guild)
+            await db.clear_action(case_id)
+            case = await db.get_case(case_id)
+            user = guild.get_member(int(case["target_user_id"])) or await bot.fetch_user(int(case["target_user_id"]))
+            await post_mod_log(guild, case, "Removed Action", user, f"<@{interaction.user.id}>",
+                                "Removed Moderation Action", None, discord.Color.red())
+            embed = build_case_embed(case, guild)
+            await interaction.response.edit_message(embed=embed, view=PostActionView())
+            return
 
+        if choice == "change_duration":
+            allowed = VALID_DURATIONS_BY_ACTION.get(case["action_type"], [])
+            embed = build_case_embed(case, guild)
+            await interaction.response.edit_message(embed=embed, view=ChangeDurationView(allowed))
+            return
 
-class ModerationActionView(discord.ui.View):
-    def __init__(self):
+        if choice == "change_action":
+            await interaction.response.send_modal(
+                ModerationActionModal(case_id=case_id, prefill_reason=case.get("reason_by_moderator"))
+            )
+            return
+
+class EditChoiceView(discord.ui.View):
+    def __init__(self, duration_capable: bool = True):
         super().__init__(timeout=None)
-        self.add_item(ModerationActionSelect())
+        self.add_item(EditChoiceSelect(duration_capable))
 
 
-class LongDurationSelect(discord.ui.Select):
-    def __init__(self):
-        labels = ["Permanent", "1 hour", "12 hour", "1 day", "3 day", "1 week",
-                   "2 week", "1 month", "2 month", "6 month", "1 year"]
-        keys = list(TIME_OPTIONS_LONG.keys())
-        options = [discord.SelectOption(label=l, value=k) for l, k in zip(labels, keys)]
-        super().__init__(placeholder="Time", options=options, custom_id="modsys:time_long",
+class ChangeDurationSelect(discord.ui.Select):
+    def __init__(self, allowed_keys=None):
+        keys = allowed_keys or DURATION_KEYS_ORDER
+        options = [discord.SelectOption(label=DURATION_LABELS[k], value=k) for k in keys]
+        super().__init__(placeholder="Duration", options=options, custom_id="modsys:change_duration",
                           min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
@@ -677,37 +919,36 @@ class LongDurationSelect(discord.ui.Select):
         case = await db.get_case(case_id)
         if not case or not case["claimed_by_id"] or int(case["claimed_by_id"]) != interaction.user.id:
             return await interaction.response.send_message("❌ Not your case to act on.", ephemeral=True)
-        delta = TIME_OPTIONS_LONG[self.values[0]]
-        await finalize_and_apply(interaction, case_id, case["action_type"], delta)
 
+        duration_key = self.values[0]
+        guild = interaction.guild
+        member = guild.get_member(int(case["target_user_id"]))
+        action_type = case["action_type"]
+        delta = DURATION_DELTAS.get(duration_key)
+        expires_at = (datetime.now(timezone.utc) + delta) if delta else None
+        expires_at_iso = expires_at.isoformat() if expires_at else None
 
-class LongDurationView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(LongDurationSelect())
+        try:
+            if action_type == "timeout" and member:
+                await member.timeout(delta, reason="Duration changed by moderator")
+        except discord.Forbidden:
+            pass
 
-
-class TimeoutDurationSelect(discord.ui.Select):
-    def __init__(self):
-        labels = ["1 minute", "5 minutes", "10 minutes", "1 hour", "1 day", "1 week"]
-        keys = list(TIME_OPTIONS_TIMEOUT.keys())
-        options = [discord.SelectOption(label=l, value=k) for l, k in zip(labels, keys)]
-        super().__init__(placeholder="Time", options=options, custom_id="modsys:time_timeout",
-                          min_values=1, max_values=1)
-
-    async def callback(self, interaction: discord.Interaction):
-        case_id = await get_case_id_from_message(interaction.message)
+        await db.update_action_expiry(case_id, expires_at_iso)
         case = await db.get_case(case_id)
-        if not case or not case["claimed_by_id"] or int(case["claimed_by_id"]) != interaction.user.id:
-            return await interaction.response.send_message("❌ Not your case to act on.", ephemeral=True)
-        delta = TIME_OPTIONS_TIMEOUT[self.values[0]]
-        await finalize_and_apply(interaction, case_id, "timeout", delta)
+
+        user = member or await bot.fetch_user(int(case["target_user_id"]))
+        await post_mod_log(guild, case, ACTION_LABELS.get(action_type, "Updated"), user,
+                            f"<@{interaction.user.id}>", "Changed duration", expires_at, discord.Color.red())
+
+        embed = build_case_embed(case, guild)
+        await interaction.response.edit_message(embed=embed, view=PostActionView())
 
 
-class TimeoutDurationView(discord.ui.View):
-    def __init__(self):
+class ChangeDurationView(discord.ui.View):
+    def __init__(self, allowed_keys=None):
         super().__init__(timeout=None)
-        self.add_item(TimeoutDurationSelect())
+        self.add_item(ChangeDurationSelect(allowed_keys))
 
 
 class PostActionView(discord.ui.View):
@@ -720,10 +961,9 @@ class PostActionView(discord.ui.View):
         case = await db.get_case(case_id)
         if not case or not case["claimed_by_id"] or int(case["claimed_by_id"]) != interaction.user.id:
             return await interaction.response.send_message("❌ Not your case to edit.", ephemeral=True)
-        await db.reset_case_for_edit(case_id)
-        case = await db.get_case(case_id)
+        duration_capable = case["action_type"] in ("mute", "ban", "timeout")
         embed = build_case_embed(case, interaction.guild)
-        await interaction.response.edit_message(embed=embed, view=ModerationActionView())
+        await interaction.response.edit_message(embed=embed, view=EditChoiceView(duration_capable))
 
     @discord.ui.button(label="Ticket", style=discord.ButtonStyle.primary, custom_id="modsys:ticket")
     async def ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -751,78 +991,6 @@ class PostActionView(discord.ui.View):
             f"- ticket opened for Case #{case_id}."
         )
         await interaction.response.send_message(f"✅ Ticket opened: {thread.mention}", ephemeral=True)
-
-
-async def delete_case_message(guild: discord.Guild, message_link: str):
-    """Attempts to delete the original offending message and returns its
-    text content (for use as Proof) if it could be fetched first."""
-    try:
-        parts = message_link.split('/')
-        channel_id = int(parts[-2])
-        msg_id = int(parts[-1])
-        channel = guild.get_channel(channel_id)
-        if not channel:
-            return None
-        msg = await channel.fetch_message(msg_id)
-        content = msg.content or None
-        await msg.delete()
-        return content
-    except (discord.NotFound, discord.Forbidden, ValueError, IndexError):
-        return None
-
-
-async def finalize_and_apply(interaction: discord.Interaction, case_id: int, action_type: str, delta):
-    case = await db.get_case(case_id)
-    guild = interaction.guild
-    member = guild.get_member(int(case["target_user_id"]))
-    reason = build_case_description(case)
-    expires_at = (datetime.now(timezone.utc) + delta) if delta else None
-    expires_at_iso = expires_at.isoformat() if expires_at else None
-
-    try:
-        if action_type == "kick" and member:
-            await member.kick(reason=reason)
-        elif action_type == "ban":
-            await guild.ban(member or discord.Object(id=int(case["target_user_id"])), reason=reason)
-            await db.create_active_action(case_id, guild.id, case["target_user_id"], "ban", expires_at_iso)
-        elif action_type == "mute" and member:
-            role = get_muted_role(guild)
-            if role:
-                await member.add_roles(role, reason=reason)
-            await db.create_active_action(case_id, guild.id, case["target_user_id"], "mute", expires_at_iso)
-        elif action_type == "timeout" and member:
-            await member.timeout(delta, reason=reason)
-            await db.create_active_action(case_id, guild.id, case["target_user_id"], "timeout", expires_at_iso)
-        # "skip" -> no action taken
-    except discord.Forbidden:
-        pass
-
-    # If the message was still standing (not already removed by automod) and
-    # a real action was taken (anything but Skip), delete it now and capture
-    # its content as Proof, since the Message Link can no longer be shown.
-    if action_type != "skip" and not case["message_deleted"] and case["message_link"]:
-        content = await delete_case_message(guild, case["message_link"])
-        await db.mark_message_deleted(case_id, proof_text=content)
-
-    await db.finalize_case(case_id, action_type, expires_at_iso)
-    case = await db.get_case(case_id)
-
-    if action_type != "skip":
-        try:
-            user = member or await bot.fetch_user(int(case["target_user_id"]))
-            moderator_display = f"<@{case['claimed_by_id']}>" if not case["automod"] else "Automod (Anime World)"
-            await post_mod_log(
-                guild, case, action_type.capitalize(), user, moderator_display,
-                reason, expires_at, discord.Color.red()
-            )
-        except discord.NotFound:
-            pass
-
-    embed = build_case_embed(case, guild)
-    view = None if action_type == "skip" else PostActionView()
-    if action_type == "skip":
-        view = discord.ui.View()  # no buttons left once skipped
-    await interaction.response.edit_message(embed=embed, view=view)
 
 
 # =========================================================================
@@ -868,11 +1036,20 @@ async def ai_moderate_text(text: str):
             data = await resp.json()
 
         # Response shape: [[{"label": "toxic", "score": 0.98}, ...]]
+        # The generic "toxic" label alone is the main source of false
+        # positives on ordinary conversation ("hard to kill", "facial
+        # expression", joking threats) - it's excluded entirely. "threat"
+        # needs a much higher bar since violent-sounding jokes/hyperbole
+        # trip it easily; the other specific categories use the normal bar.
         scores = data[0] if data and isinstance(data, list) else []
-        flagged_labels = {
-            item["label"] for item in scores
-            if item.get("label") != "not_toxic" and item.get("score", 0) >= HF_THRESHOLD
-        }
+        flagged_labels = set()
+        for item in scores:
+            label = item.get("label")
+            score = item.get("score", 0)
+            if label == "threat" and score >= HF_THREAT_THRESHOLD:
+                flagged_labels.add(label)
+            elif label in HF_SPECIFIC_LABELS and score >= HF_THRESHOLD:
+                flagged_labels.add(label)
         return bool(flagged_labels), flagged_labels
     except Exception as e:
         print(f"[automod] Hugging Face API error: {e}")
@@ -1126,3 +1303,4 @@ if TOKEN:
     bot.run(TOKEN)
 else:
     print("FATAL ERROR: DISCORD_TOKEN environment variable not found.")
+            
